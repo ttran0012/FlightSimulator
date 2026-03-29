@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\trant\Documents\FlightSimulator\FlightSimulator\build\CMakeFiles\1b9192bfac92eb85da144c68e327e50f\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{B0170829-FE7E-38CC-88FF-6E487432CE83}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
