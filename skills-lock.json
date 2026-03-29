@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "skills": {
+    "code-review": {
+      "source": "anthropics/knowledge-work-plugins",
+      "sourceType": "github",
+      "computedHash": "2b1ac29c8d03ecdd6dbb9d0ebc8cdb05965151bedceed36f262546785b3123bc"
+    },
+    "coder": {
+      "source": "starchild-ai-agent/official-skills",
+      "sourceType": "github",
+      "computedHash": "97ec4883da3c0dc1b5c73de5b5be7edaa60e381de47161e5e301bdd4ef41593e"
+    },
+    "documentation-writer": {
+      "source": "github/awesome-copilot",
+      "sourceType": "github",
+      "computedHash": "ee53d65b163cd7eb953a930c95841cfe398cc2c0bd24c06508bbaa07c432be35"
+    },
+    "github-pr": {
+      "source": "gentleman-programming/gentleman-skills",
+      "sourceType": "github",
+      "computedHash": "3cb26e27443738a1c1cecdb921571d410d428778cd0a0cf07181202dada090ab"
+    }
+  }
+}

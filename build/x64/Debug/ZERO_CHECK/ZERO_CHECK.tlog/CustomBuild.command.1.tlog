@@ -1,0 +1,10 @@
+^C:\USERS\TRANT\DOCUMENTS\FLIGHTSIMULATOR\FLIGHTSIMULATOR\BUILD\CMAKEFILES\1B9192BFAC92EB85DA144C68E327E50F\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SC:/Users/trant/Documents/FlightSimulator/FlightSimulator -BC:/Users/trant/Documents/FlightSimulator/FlightSimulator/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/trant/Documents/FlightSimulator/FlightSimulator/build/FlightSimulator.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
