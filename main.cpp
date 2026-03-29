@@ -1,6 +1,9 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include <windows.h>
 #include <opencv2/opencv.hpp>
@@ -13,44 +16,61 @@ using namespace cv::dnn;
 using namespace std;
 
 
-Mat captureScreen() {
-    // Get screen dimensions
-    int width = GetSystemMetrics(SM_CXSCREEN);
-    int height = GetSystemMetrics(SM_CYSCREEN);
+class ScreenCapturer {
+public:
+    ScreenCapturer() {
+        width = GetSystemMetrics(SM_CXSCREEN);
+        height = GetSystemMetrics(SM_CYSCREEN);
 
-    // Set up screen capture
-    HDC hScreen = GetDC(NULL);
-    HDC hCapture = CreateCompatibleDC(hScreen);
-    HBITMAP hBitmap = CreateCompatibleBitmap(hScreen, width, height);
-    SelectObject(hCapture, hBitmap);
+        hScreen = GetDC(NULL);
+        hCapture = CreateCompatibleDC(hScreen);
+        if (!hScreen || !hCapture)
+            throw runtime_error("Failed to create screen DC");
 
-    // Copy screen to bitmap
-    BitBlt(hCapture, 0, 0, width, height, hScreen, 0, 0, SRCCOPY);
+        hBitmap = CreateCompatibleBitmap(hScreen, width, height);
+        oldObj = SelectObject(hCapture, hBitmap);
 
-    // Convert to OpenCV Mat
-    BITMAPINFOHEADER bi;
-    bi.biSize = sizeof(BITMAPINFOHEADER);
-    bi.biWidth = width;
-    bi.biHeight = -height;  // negative = top-down
-    bi.biPlanes = 1;
-    bi.biBitCount = 32;
-    bi.biCompression = BI_RGB;
-    bi.biSizeImage = 0;
+        bi.biSize = sizeof(BITMAPINFOHEADER);
+        bi.biWidth = width;
+        bi.biHeight = -height; // top-down
+        bi.biPlanes = 1;
+        bi.biBitCount = 32;
+        bi.biCompression = BI_RGB;
 
-    Mat frame(height, width, CV_8UC4);
-    GetDIBits(hCapture, hBitmap, 0, height, frame.data,
-        (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+        bgra.create(height, width, CV_8UC4);
+        bgr.create(height, width, CV_8UC3);
+    }
 
-    // Cleanup
-    DeleteObject(hBitmap);
-    DeleteDC(hCapture);
-    ReleaseDC(NULL, hScreen);
+    ~ScreenCapturer() {
+        SelectObject(hCapture, oldObj);
+        DeleteObject(hBitmap);
+        DeleteDC(hCapture);
+        ReleaseDC(NULL, hScreen);
+    }
 
-    // Convert from BGRA to BGR (OpenCV standard)
-    Mat bgr;
-    cvtColor(frame, bgr, COLOR_BGRA2BGR);
-    return bgr;
-}
+    ScreenCapturer(const ScreenCapturer&) = delete;
+    ScreenCapturer& operator=(const ScreenCapturer&) = delete;
+
+    const Mat& grab() {
+        BitBlt(hCapture, 0, 0, width, height, hScreen, 0, 0, SRCCOPY);
+        GetDIBits(hCapture, hBitmap, 0, height, bgra.data,
+                  (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+        cvtColor(bgra, bgr, COLOR_BGRA2BGR);
+        return bgr;
+    }
+
+    int getWidth() const { return width; }
+    int getHeight() const { return height; }
+
+private:
+    int width = 0, height = 0;
+    HDC hScreen = nullptr;
+    HDC hCapture = nullptr;
+    HBITMAP hBitmap = nullptr;
+    HGDIOBJ oldObj = nullptr;
+    BITMAPINFOHEADER bi{};
+    Mat bgra, bgr;
+};
 
 
 // Full COCO 80 class names (YOLOv8 default)
@@ -72,39 +92,73 @@ vector<string> cocoNames = {
     "scissors", "teddy bear", "hair drier", "toothbrush"
 };
 
-// Colors for difference detection types
+// Colors for detection types
 Scalar FACE_COLOR(0, 255, 0); // green
 Scalar VEHICLE_COLOR(255, 0, 0);
 Scalar PLATE_COLOR(0, 255, 255); // yellow
 
-int main(int argc, char** argv) {
-    Mat frame = captureScreen();
-    const float detScale = 0.5f;  // run detection at half resolution
+// Shared state
+atomic<bool> running(true);
+
+Mat latestFrame;
+mutex frameMutex;
+
+struct FaceResult {
+    Rect box;
+    float confidence;
+};
+vector<FaceResult> faceResults;
+mutex faceMutex;
+
+struct YoloResult {
+    Rect box;
+    int classId;
+    float confidence;
+};
+vector<YoloResult> yoloResults;
+mutex yoloMutex;
+
+void captureThread(ScreenCapturer& screen) {
+    while (running) {
+        Mat frame = screen.grab().clone();
+        {
+            lock_guard<mutex> lock(frameMutex);
+            latestFrame = frame;
+        }
+        this_thread::sleep_for(chrono::milliseconds(1));
+    }
+}
+
+void faceDetectionThread() {
+    const float detScale = 0.5f;
+
+    // Get initial frame size to create detector
+    Mat frame;
+    while (running) {
+        lock_guard<mutex> lock(frameMutex);
+        if (!latestFrame.empty()) {
+            frame = latestFrame.clone();
+            break;
+        }
+    }
+    if (!running) return;
+
     Mat small;
     resize(frame, small, Size(), detScale, detScale);
 
-    // Face model
     Ptr<FaceDetectorYN> detector = FaceDetectorYN::create(
         "face_detector/face_detection_yunet_2023mar.onnx",
         "",
         small.size(),
-        0.5f,   // confidence threshold
-        0.3f,   // nms threshold
-        100     // top k
+        0.5f, 0.3f, 100
     );
 
-    // YOLOv8 Vehicle model
-    Net yoloNet = readNetFromONNX("YOLOv8/yolov8n.onnx");
-    if (yoloNet.empty()) {
-        cerr << "Failed to load YOLO Model!" << endl;
-        return - 1;
-    }
-
-    namedWindow("Screen Face Detection", WINDOW_NORMAL);
-    resizeWindow("Screen Face Detection", 800, 600);
-
-    while (true) {
-        frame = captureScreen();
+    while (running) {
+        {
+            lock_guard<mutex> lock(frameMutex);
+            if (latestFrame.empty()) continue;
+            frame = latestFrame.clone();
+        }
 
         resize(frame, small, Size(), detScale, detScale);
         detector->setInputSize(small.size());
@@ -112,85 +166,70 @@ int main(int argc, char** argv) {
         Mat faces;
         detector->detect(small, faces);
 
+        vector<FaceResult> results;
         for (int i = 0; i < faces.rows; i++) {
             float* data = faces.ptr<float>(i);
             int x1 = static_cast<int>(data[0] / detScale);
             int y1 = static_cast<int>(data[1] / detScale);
-            int x2 = x1 + static_cast<int>(data[2] / detScale);
-            int y2 = y1 + static_cast<int>(data[3] / detScale);
-            float confidence = data[14];
+            int w = static_cast<int>(data[2] / detScale);
+            int h = static_cast<int>(data[3] / detScale);
 
-            // Clamp coordinates to frame bounds
             x1 = max(0, x1);
             y1 = max(0, y1);
-            x2 = min(x2, frame.cols);
-            y2 = min(y2, frame.rows);
+            w = min(w, frame.cols - x1);
+            h = min(h, frame.rows - y1);
+            if (w <= 0 || h <= 0) continue;
 
-            int faceW = x2 - x1;
-            int faceH = y2 - y1;
-            if (faceW <= 0 || faceH <= 0) continue;
-
-            //// Draw rectangle on main image
-            rectangle(frame, Point(x1, y1), Point(x2, y2), Scalar(0, 255, 0), 1);
-            string label = "Face: " + to_string(int(confidence * 100)) + "%";
-            putText(frame, label, Point(x1, y1 - 10),
-                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
-            // crop face
-            Mat faceCrop = frame(Rect(x1, y1, faceW, faceH)).clone();
-
-            // Resize the crop to a fixed thumbnail size
-            int thumbSize = 150;
-            Mat thumbnail;
-            resize(faceCrop, thumbnail, Size(thumbSize, thumbSize));
-
-            // Place it in the upper-left corner
-            // Offset each face so they don't overlap
-            int offsetX = 10 + i * (thumbSize + 10);
-            int offsetY = 10;
-
-            // Make sure it fits on screen
-            if (offsetX + thumbSize < frame.cols && offsetY + thumbSize < frame.rows) {
-                Mat roi = frame(Rect(offsetX, offsetY, thumbSize, thumbSize));
-                double alpha = 1; // thumbnail opacity
-                addWeighted(thumbnail, alpha, roi, 1.0 - alpha, 0, roi);
-
-                // Draw a border around the thumbnail
-                rectangle(frame, Rect(offsetX, offsetY, thumbSize, thumbSize),
-                    Scalar(0, 255, 0), 1);
-
-                // Label it
-                string label = "Face " + to_string(i + 1);
-                putText(frame, label, Point(offsetX, offsetY + thumbSize + 20),
-                    FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
-            }
+            results.push_back({Rect(x1, y1, w, h), data[14]});
         }
 
-        // YOLOv8 inference
-        const int yoloSize = 640;
+        {
+            lock_guard<mutex> lock(faceMutex);
+            faceResults = move(results);
+        }
+    }
+}
+
+void yoloDetectionThread() {
+    Net yoloNet = readNetFromONNX("YOLOv8/yolo11m.onnx");
+    if (yoloNet.empty()) {
+        cerr << "Failed to load YOLO Model!" << endl;
+        running = false;
+        return;
+    }
+
+    const int yoloSize = 640;
+    const float yoloConfThresh = 0.5f;
+    const float yoloNMSThresh = 0.4f;
+
+    while (running) {
+        Mat frame;
+        {
+            lock_guard<mutex> lock(frameMutex);
+            if (latestFrame.empty()) continue;
+            frame = latestFrame.clone();
+        }
+
         float xScale = (float)frame.cols / yoloSize;
         float yScale = (float)frame.rows / yoloSize;
 
-        Mat yoloBlob = blobFromImage(frame, 1.0 / 255.0, Size(yoloSize, yoloSize), Scalar(), true, false);
-        yoloNet.setInput(yoloBlob);
+        Mat blob = blobFromImage(frame, 1.0 / 255.0, Size(yoloSize, yoloSize), Scalar(), true, false);
+        yoloNet.setInput(blob);
         Mat yoloOut = yoloNet.forward();
 
-        // Reshape [1, 4+classes, 8400] -> transpose to [8400, 4+classes]
         Mat output = yoloOut.reshape(1, yoloOut.size[1]);
         Mat outputT;
         transpose(output, outputT);
 
         int numClasses = outputT.cols - 4;
-        const float yoloConfThresh = 0.5f;
-        const float yoloNMSThresh  = 0.4f;
 
-        vector<Rect>  yoloBoxes;
-        vector<float> yoloConfs;
-        vector<int>   yoloClassIds;
+        vector<Rect> boxes;
+        vector<float> confs;
+        vector<int> classIds;
 
         for (int i = 0; i < outputT.rows; i++) {
             float* row = outputT.ptr<float>(i);
 
-            // Find highest scoring class
             float maxScore = 0;
             int classId = 0;
             for (int c = 0; c < numClasses; c++) {
@@ -201,42 +240,107 @@ int main(int argc, char** argv) {
             }
             if (maxScore < yoloConfThresh) continue;
 
-            // Convert cx,cy,w,h -> x1,y1,w,h
             float cx = row[0] * xScale;
             float cy = row[1] * yScale;
-            float w  = row[2] * xScale;
-            float h  = row[3] * yScale;
+            float w = row[2] * xScale;
+            float h = row[3] * yScale;
             int x1 = static_cast<int>(cx - w / 2);
             int y1 = static_cast<int>(cy - h / 2);
 
-            yoloBoxes.push_back(Rect(x1, y1, (int)w, (int)h));
-            yoloConfs.push_back(maxScore);
-            yoloClassIds.push_back(classId);
+            boxes.push_back(Rect(x1, y1, (int)w, (int)h));
+            confs.push_back(maxScore);
+            classIds.push_back(classId);
         }
 
-        // Non-maximum suppression
-        vector<int> yoloIndices;
-        NMSBoxes(yoloBoxes, yoloConfs, yoloConfThresh, yoloNMSThresh, yoloIndices);
+        vector<int> indices;
+        NMSBoxes(boxes, confs, yoloConfThresh, yoloNMSThresh, indices);
 
-        for (int idx : yoloIndices) {
-            Rect  box     = yoloBoxes[idx];
-            int   classId = yoloClassIds[idx];
-            float conf    = yoloConfs[idx];
-
-            string className = (classId < (int)cocoNames.size())
-                ? cocoNames[classId] : "obj" + to_string(classId);
-            string label = className + ": " + to_string(int(conf * 100)) + "%";
-
-            rectangle(frame, box, VEHICLE_COLOR, 2);
-            putText(frame, label, Point(box.x, box.y - 10),
-                FONT_HERSHEY_SIMPLEX, 0.6, VEHICLE_COLOR, 2);
+        vector<YoloResult> results;
+        for (int idx : indices) {
+            results.push_back({boxes[idx], classIds[idx], confs[idx]});
         }
 
-        imshow("Screen Face Detection", frame);
+        {
+            lock_guard<mutex> lock(yoloMutex);
+            yoloResults = move(results);
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    ScreenCapturer screen;
+
+    thread capThread(captureThread, ref(screen));
+    thread faceThread(faceDetectionThread);
+    thread yoloThread(yoloDetectionThread);
+
+    namedWindow("ScreenSight", WINDOW_NORMAL);
+    resizeWindow("ScreenSight", 800, 600);
+
+    while (running) {
+        Mat frame;
+        {
+            lock_guard<mutex> lock(frameMutex);
+            if (latestFrame.empty()) continue;
+            frame = latestFrame.clone();
+        }
+
+        // Draw face detections
+        {
+            lock_guard<mutex> lock(faceMutex);
+            for (int i = 0; i < (int)faceResults.size(); i++) {
+                const auto& f = faceResults[i];
+                rectangle(frame, f.box, FACE_COLOR, 1);
+                string label = "Face: " + to_string(int(f.confidence * 100)) + "%";
+                putText(frame, label, Point(f.box.x, f.box.y - 10),
+                    FONT_HERSHEY_SIMPLEX, 0.6, FACE_COLOR, 2);
+
+                // Clamp crop to frame bounds
+                Rect safeBox = f.box & Rect(0, 0, frame.cols, frame.rows);
+                if (safeBox.width <= 0 || safeBox.height <= 0) continue;
+
+                Mat faceCrop = frame(safeBox).clone();
+                int thumbSize = 150;
+                Mat thumbnail;
+                resize(faceCrop, thumbnail, Size(thumbSize, thumbSize));
+
+                int offsetX = 10 + i * (thumbSize + 10);
+                int offsetY = 10;
+
+                if (offsetX + thumbSize < frame.cols && offsetY + thumbSize < frame.rows) {
+                    Mat roi = frame(Rect(offsetX, offsetY, thumbSize, thumbSize));
+                    thumbnail.copyTo(roi);
+                    rectangle(frame, Rect(offsetX, offsetY, thumbSize, thumbSize), FACE_COLOR, 1);
+                    string thumbLabel = "Face " + to_string(i + 1);
+                    putText(frame, thumbLabel, Point(offsetX, offsetY + thumbSize + 20),
+                        FONT_HERSHEY_SIMPLEX, 0.6, FACE_COLOR, 2);
+                }
+            }
+        }
+
+        // Draw YOLO detections
+        {
+            lock_guard<mutex> lock(yoloMutex);
+            for (const auto& r : yoloResults) {
+                string className = (r.classId < (int)cocoNames.size())
+                    ? cocoNames[r.classId] : "obj" + to_string(r.classId);
+                string label = className + ": " + to_string(int(r.confidence * 100)) + "%";
+
+                rectangle(frame, r.box, VEHICLE_COLOR, 2);
+                putText(frame, label, Point(r.box.x, r.box.y - 10),
+                    FONT_HERSHEY_SIMPLEX, 0.6, VEHICLE_COLOR, 2);
+            }
+        }
+
+        imshow("ScreenSight", frame);
 
         if (waitKey(1) == 'q')
-            break;
+            running = false;
     }
+
+    capThread.join();
+    faceThread.join();
+    yoloThread.join();
 
     destroyAllWindows();
     return 0;
